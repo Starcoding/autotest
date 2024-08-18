@@ -1,227 +1,136 @@
-from time import sleep
+from datetime import datetime, timedelta
+from typing import List, Optional
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import jwt
+import secrets
 
-from flasgger import Swagger
-from flask import Flask, jsonify, request
-from flask_sqlalchemy import SQLAlchemy
+# Конфигурация базы данных
+DATABASE_URL = "postgresql://test_user:test_pass@db:5432/humans_db"
+SECRET_KEY = "your_secret_key"
+ALGORITHM = "HS256"
 
-sleep(3)
+# Настройка SQLAlchemy
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "postgresql://test_user:test_pass@db:5432/humans_db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-db = SQLAlchemy(app)
+# Определение модели Human
+class Human(Base):
+    __tablename__ = "humans"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    age = Column(Integer, nullable=False)
+    sex = Column(String, nullable=False)
 
-swagger = Swagger(app)
+# Создание таблиц
+Base.metadata.create_all(bind=engine)
 
+# Модель для Pydantic (для сериализации/десериализации)
+class HumanBase(BaseModel):
+    name: str
+    age: int
+    sex: str
 
+class HumanCreate(HumanBase):
+    pass
 
-# Определяем модель Human
-class Human(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80), nullable=False)
-    age = db.Column(db.Integer, nullable=False)
-    sex = db.Column(db.String(10), nullable=False)
+class HumanOut(HumanBase):
+    id: int
 
+    class Config:
+        orm_mode = True
 
-# Создаем таблицы
-with app.app_context():
-    db.create_all()
+# Создание FastAPI приложения
+app = FastAPI()
 
-# Эндпоинты для CRUD операций
+# OAuth2 схема для JWT токенов
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-@app.route("/", methods=["GET"])
-def hello():
+# Временное хранилище API ключа
+api_key = None
+
+# Функция для создания токена
+def create_jwt_token(username: str):
+    to_encode = {
+        "sub": username,
+        "exp": datetime.utcnow() + timedelta(minutes=30)
+    }
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# Зависимость для получения текущей сессии базы данных
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Зависимость для проверки токена
+def token_required(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+@app.get("/", response_model=str)
+def hello(token: str = Depends(token_required)):
     return "Привет!"
 
-# Получить всех людей
-@app.route("/humans", methods=["GET"])
-def get_humans():
-    """
-    Retrieve all humans
-    ---
-    responses:
-      200:
-        description: A list of humans
-        schema:
-          type: array
-          items:
-            type: object
-            properties:
-              id:
-                type: integer
-                description: The human ID
-              name:
-                type: string
-                description: The human's name
-              age:
-                type: integer
-                description: The human's age
-              sex:
-                type: string
-                description: The human's sex
-    """
-    humans = Human.query.all()
-    return jsonify(
-        [{"id": h.id, "name": h.name, "age": h.age, "sex": h.sex} for h in humans]
-    )
+@app.post("/login", response_model=dict)
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    if form_data.username == "admin" and form_data.password == "password":
+        token = create_jwt_token(form_data.username)
+        return {"token": token}
+    raise HTTPException(status_code=400, detail="Invalid credentials")
 
+@app.get("/humans", response_model=List[HumanOut])
+def get_humans(db: Session = Depends(get_db), token: str = Depends(token_required)):
+    humans = db.query(Human).all()
+    return humans
 
-@app.route("/humans/<int:id>", methods=["GET"])
-def get_human(id):
-    """
-    Retrieve a human by ID
-    ---
-    parameters:
-      - in: path
-        name: id
-        type: integer
-        required: true
-        description: The human ID
-    responses:
-      200:
-        description: A human object
-        schema:
-          type: object
-          properties:
-            id:
-              type: integer
-              description: The human ID
-            name:
-              type: string
-              description: The human's name
-            age:
-              type: integer
-              description: The human's age
-            sex:
-              type: string
-              description: The human's sex
-      404:
-        description: Human not found
-    """
-    human = Human.query.get_or_404(id)
-    return jsonify(
-        {"id": human.id, "name": human.name, "age": human.age, "sex": human.sex}
-    )
+@app.get("/humans/{id}", response_model=HumanOut)
+def get_human(id: int, db: Session = Depends(get_db), token: str = Depends(token_required)):
+    human = db.query(Human).filter(Human.id == id).first()
+    if human is None:
+        raise HTTPException(status_code=404, detail="Human not found")
+    return human
 
+@app.post("/humans", response_model=HumanOut, status_code=201)
+def create_human(human: HumanCreate, db: Session = Depends(get_db), token: str = Depends(token_required)):
+    db_human = Human(**human.dict())
+    db.add(db_human)
+    db.commit()
+    db.refresh(db_human)
+    return db_human
 
-@app.route("/humans", methods=["POST"])
-def create_human():
-    """
-    Create a new human
-    ---
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            name:
-              type: string
-              description: The human's name
-            age:
-              type: integer
-              description: The human's age
-            sex:
-              type: string
-              description: The human's sex
-    responses:
-      201:
-        description: The human was created successfully
-        schema:
-          type: object
-          properties:
-            id:
-              type: integer
-              description: The created human's ID
-    """
-    data = request.json
-    new_human = Human(name=data["name"], age=data["age"], sex=data["sex"])
-    db.session.add(new_human)
-    db.session.commit()
-    return jsonify({"id": new_human.id}), 201
+@app.put("/humans/{id}", response_model=HumanOut)
+def update_human(id: int, human: HumanCreate, db: Session = Depends(get_db), token: str = Depends(token_required)):
+    db_human = db.query(Human).filter(Human.id == id).first()
+    if db_human is None:
+        raise HTTPException(status_code=404, detail="Human not found")
+    db_human.name = human.name
+    db_human.age = human.age
+    db_human.sex = human.sex
+    db.commit()
+    db.refresh(db_human)
+    return db_human
 
-
-@app.route("/humans/<int:id>", methods=["PUT"])
-def update_human(id):
-    """
-    Update an existing human
-    ---
-    parameters:
-      - in: path
-        name: id
-        type: integer
-        required: true
-        description: The human ID
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            name:
-              type: string
-              description: The human's name
-            age:
-              type: integer
-              description: The human's age
-            sex:
-              type: string
-              description: The human's sex
-    responses:
-      200:
-        description: The updated human object
-        schema:
-          type: object
-          properties:
-            id:
-              type: integer
-              description: The human ID
-            name:
-              type: string
-              description: The human's name
-            age:
-              type: integer
-              description: The human's age
-            sex:
-              type: string
-              description: The human's sex
-      404:
-        description: Human not found
-    """
-    human = Human.query.get_or_404(id)
-    data = request.json
-    human.name = data.get("name", human.name)
-    human.age = data.get("age", human.age)
-    human.sex = data.get("sex", human.sex)
-    db.session.commit()
-    return jsonify(
-        {"id": human.id, "name": human.name, "age": human.age, "sex": human.sex}
-    )
-
-
-@app.route("/humans/<int:id>", methods=["DELETE"])
-def delete_human(id):
-    """
-    Delete a human by ID
-    ---
-    parameters:
-      - in: path
-        name: id
-        type: integer
-        required: true
-        description: The human ID
-    responses:
-      204:
-        description: The human was deleted successfully
-      404:
-        description: Human not found
-    """
-    human = Human.query.get_or_404(id)
-    db.session.delete(human)
-    db.session.commit()
-    return jsonify({"message": f"id {id} deleted"}), 204
-
-
-if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=8080)
+@app.delete("/humans/{id}", status_code=204)
+def delete_human(id: int, db: Session = Depends(get_db), token: str = Depends(token_required)):
+    db_human = db.query(Human).filter(Human.id == id).first()
+    if db_human is None:
+        raise HTTPException(status_code=404, detail="Human not found")
+    db.delete(db_human)
+    db.commit()
+    return {"message": f"id {id} deleted"}
